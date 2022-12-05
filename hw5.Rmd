@@ -1,0 +1,437 @@
+---
+title: "hw5"
+output: html_document
+date: '2022-10-26'
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+rm(list=ls())
+setwd("D:/proj_santander")
+getwd()
+library(MASS)
+library(glmnet)
+library(leaps)
+library(lars)
+library(tidyverse)
+library(tictoc)
+library(randomForest)
+library(gbm)
+```
+
+## 1 import data
+
+```{r }
+san <- read.csv("train.csv")
+
+dim(san) #76020 x 371
+
+```
+
+## 2 data cleaning
+
+```{r }
+
+## any duplicate columns by name?
+length(unique(names(san))) #371 cols names unique
+length(names(san))
+
+
+## remove  duplicate columns by values
+dim(san) #76020 x 371
+sannew <- san[!duplicated(as.list(san))]
+dim(sannew) #76020 x 309 cols -62cols
+
+
+## null or na values
+is.null(sannew) #not null
+sum(is.na(sannew)) #no NA values
+
+
+## remove columns with only 0's
+sannew[apply(sannew, 2, function(x) all(x == 0))] <- NULL
+dim(sannew) #76020 x 308
+
+
+```
+
+
+## 3 train/validate/test split
+
+```{r} 
+
+## shuffle dataset
+set.seed(7406)
+sannew <- sannew[order(runif(nrow(sannew))),]
+
+## prepare dataset with 50/50 0s and 1s
+san0 <- sannew[sannew$TARGET == 0,]
+san1 <- sannew[sannew$TARGET == 1,]
+
+nrow(san0) #73012
+nrow(san1) #3008
+
+set.seed(7406)
+flag0 <- sort(sample(73012,1430, replace = FALSE))
+set.seed(7406)
+flag1 <- sort(sample(3008,1430,replace=FALSE))
+san5050 <- rbind(san0[flag0,],san1[flag1,])
+
+summary(as.factor(san5050$TARGET))
+dim(san5050)
+
+## split data 70% train 15% validate 15% test
+
+#function
+traintestsplit <- function(data) {
+  set.seed(7406)
+  
+  rand_row <- sample(rep(1:3,diff(floor(nrow(data) * c(0,0.7,0.85,1)))))
+  
+  train <- data[rand_row==1,]
+  valid <- data[rand_row==2,]
+  test <- data[rand_row==3,]
+  
+  return(list("train"=train, "valid"=valid, "test"=test))
+  
+}
+
+#results
+sanfin <- traintestsplit(san5050)
+santr <- sanfin$train[,-1]
+sanva <- sanfin$valid[,-1]
+sante <- sanfin$test[,-1]
+sanfull <- rbind(santr,sanva,sante)
+
+#check dimensions
+dim(santr) #2001 x 307
+dim(sanva) # 430 x 307
+dim(sante) # 429 x 307
+
+#check response distribution
+summary(as.factor(santr$TARGET))
+summary(as.factor(sanva$TARGET))
+summary(as.factor(sante$TARGET))
+
+
+
+
+```
+
+## 4 Exploratory Data Analysis
+
+```{r}
+## high level overview
+summary(santr)
+
+summary(santr$imp_ent_var16_ult1)
+
+summary(santr$imp_op_var41_efect_ult3)
+
+## boxplot of 1 variable against target response
+boxplot(santr$imp_op_var41_efect_ult3~as.factor(santr$TARGET),xlab="response",ylab="imp_op_var41_efect_ult3")
+
+## correlation
+cordf <- as.data.frame(cor(santr))
+index <-which(abs(cordf)>0.8 & abs(cordf) < 1,arr.ind=T)
+highcordf <- cbind.data.frame(Variable1 = rownames(cordf)[index[,1]],Variable2 = colnames(cordf)[index[,2]])
+head(highcordf,5)
+nrow(highcordf)/2
+
+#explore 1 pair of highly correlated variables
+summary(santr$imp_op_var41_comer_ult1)
+summary(santr$imp_op_var39_comer_ult1)
+
+plot(santr$imp_op_var41_comer_ult1,santr$imp_op_var39_comer_ult1,xlab="imp_op_var41_comer_ult1",ylab="imp_op_var39_comer_ult1")
+
+
+```
+
+## 5 Model training & training error
+
+6 methods are attempted, of which 3 are baseline models with no tuning, and 3 models with parameters tuning. Details are as follow:
+
+1.	logistic regression with all parameters: no tuning
+2.	lasso with lars(): no tuning
+3.	lda: no tuning
+4.	lasso/ridge with cv.glmnet() and glmnet(): 1 parameter tuned- alpha chosen at 0.2, 10 folds cross validation
+5.	random forest: 3 parameters tuned- ntrees, mtry, and nodesize
+6.	boosting: 3 parameters tuned- n.trees, shrinkage, interaction.depth
+
+
+```{r }
+#prepare data
+xtr <- as.matrix(santr[,-307])
+ytr <- santr[,307]
+X = sparse.model.matrix(as.formula(paste("TARGET ~", paste(colnames(santr[,-307]), sep = "", collapse=" +"))), data = sanfull)
+        
+##---------- 1 full model logistic regression ##----------
+
+tic("fullmod")
+set.seed(7406)
+fullmod <- glm(TARGET~., data=santr, family=binomial)
+toc() #2.5 sec
+#summary(fullmod)
+
+
+##---------- 2 lasso with lars ##----------
+set.seed(7406)
+tic("lasso")
+lassomod <- lars(xtr, ytr, type= "lasso", trace= FALSE)
+toc() #0.89 sec
+
+lassomin <- which.min(summary(lassomod)$Cp)
+lassoLambda <- lassomod$lambda[lassomin]
+lassoCoeffs <- coef(lassomod)[lassomin,]
+#lassoIntercept <- mean(ytr) - sum(lassoCoeffs * colMeans(xtr))
+#c(lassoIntercept,lassoCoeffs[lassoCoeffs!=0])
+length(lassoCoeffs[lassoCoeffs!=0]) #141 coefs
+
+
+##---------- 3 LDA  ##----------
+set.seed(7406)
+xs <- data.frame(santr)
+xs[apply(xs,2,function(x) all(x==0))] <- NULL
+dim(xs) #239cols
+rcol <- ncol(xs)
+summary(as.factor(xs[,rcol]))
+
+tic("lda")
+ldamod <- lda(as.matrix(xs[,-rcol]),as.factor(xs[,rcol]))
+toc() #0.86 sec
+
+##---------- 4 elastic net with cv.glmnet ##----------
+
+#find optimal alpha that balance Lasso (1) and Ridge (0)
+set.seed(7406)
+tic("elastic net")
+for(i in 0:10){
+  assign(paste("lrm", i, sep=""), 
+         cv.glmnet(x=X[1:nrow(santr),],
+                   y=ytr,
+                   alpha= i/10, #lambda
+                   nfolds=10, #folds for cross validation
+                   )
+         )
+}
+toc() #22.3 sec
+
+#predict response
+yhat0 <- ifelse(predict(lrm0, s=lrm0$lambda.min, newx=X[1:nrow(santr),])>0.5,1,0)
+yhat1 <- ifelse(predict(lrm1, s=lrm1$lambda.min, newx=X[1:nrow(santr),])>0.5,1,0)
+yhat2 <- ifelse(predict(lrm2, s=lrm2$lambda.min, newx=X[1:nrow(santr),])>0.5,1,0)
+yhat3 <- ifelse(predict(lrm3, s=lrm3$lambda.min, newx=X[1:nrow(santr),])>0.5,1,0)
+yhat4 <- ifelse(predict(lrm4, s=lrm4$lambda.min, newx=X[1:nrow(santr),])>0.5,1,0)
+yhat5 <- ifelse(predict(lrm5, s=lrm5$lambda.min, newx=X[1:nrow(santr),])>0.5,1,0)
+yhat6 <- ifelse(predict(lrm6, s=lrm6$lambda.min, newx=X[1:nrow(santr),])>0.5,1,0)
+yhat7 <- ifelse(predict(lrm7, s=lrm7$lambda.min, newx=X[1:nrow(santr),])>0.5,1,0)
+yhat8 <- ifelse(predict(lrm8, s=lrm8$lambda.min, newx=X[1:nrow(santr),])>0.5,1,0)
+yhat9 <- ifelse(predict(lrm9, s=lrm9$lambda.min, newx=X[1:nrow(santr),])>0.5,1,0)
+yhat10 <- ifelse(predict(lrm10, s=lrm10$lambda.min, newx=X[1:nrow(santr),])>0.5,1,0)
+
+#calculate training error
+lasso2cverror <- c(mean(yhat0 != ytr),mean(yhat1 != ytr),mean(yhat2 != ytr),mean(yhat3 != ytr),mean(yhat4 != ytr),mean(yhat5 != ytr),mean(yhat6 != ytr),mean(yhat7 != ytr),mean(yhat8 != ytr),mean(yhat9 != ytr))
+
+#find alpha that minimizes training error
+optimalalpha <- as.numeric(paste("0.",which.min(lasso2cverror)-1,sep=""))
+
+#train elastic net model
+set.seed(7406)
+lrcv <- cv.glmnet(x=X[1:nrow(santr),],
+                    y=ytr,
+                    alpha= optimalalpha, #lambda
+                    nfolds=10, #folds for cross validation
+                    standardize=FALSE
+                  )
+lrmod <- glmnet(X[1:nrow(santr),], ytr, alpha=optimalalpha)
+
+lassocoefs2 <- coef(lrmod, s=lrcv$lambda.min)
+lrcvcoefs <- lassocoefs2[lassocoefs2[,1]!=0,] 
+length(lrcvcoefs) #68 including intercept
+
+
+##---------- 4 random forests ##----------
+#tune parameters
+trees <- c(5,50,100) 
+tries <- seq(1,9,2) 
+nodes <- seq(1,9,2) 
+rfres <- NULL
+
+set.seed(7406)
+tic("random forest")
+for(i in 1:length(trees)){
+  for (j in 1:length(tries)){
+    for (k in 1:length(nodes)){
+      rfmod <- randomForest(as.factor(TARGET) ~., ntrees=trees[i],mtry=tries[j], nodesize=nodes[k], data=santr, importance=TRUE)
+      pred <- predict(rfmod, santr, type='class')
+      te <- mean(pred != ytr)
+      rfres <- rbind(rfres,c(i,j,k,te))
+    }
+  }
+}
+toc() #1106.46 sec ~18.5min
+
+#find parameters that minimizes training error
+rfdf <- as.data.frame(rfres)
+colnames(rfdf) <- c("ntrees","mtry","nodeSize","trainError")
+rfparams <- rfdf[which.min(rfdf$trainError),]
+
+#train random forest model based on best parameters
+set.seed(7406)
+tic("random forest")
+rfmod <- randomForest(as.factor(TARGET) ~.,  ntrees=trees[rfparams[[1]]], mtry=tries[rfparams[[2]]], nodesize=nodes[rfparams[[3]]], data=santr, importance=TRUE)
+toc() #32.27 sec
+
+#importance(rfmod) 
+#varImpPlot(rfmod)
+
+
+##---------- 5 boosting ##----------
+#parameters tuning
+ntrees <- c(100,500,1000)
+shrink <- c(0.01,0.1)
+idepth <- c(1,2,3)
+boostres <- NULL
+
+set.seed(7406)
+tic("adaboosting")
+for(i in 1:length(ntrees)){
+  for (j in 1:length(shrink)){
+    for (k in 1:length(idepth)){
+      gbmod <- gbm(TARGET ~ .,data=santr,
+                 distribution = 'adaboost',
+                   n.trees = ntrees[i], 
+                   shrinkage = shrink[j], 
+                   interaction.depth = idepth[k],
+                   cv.folds = 10)
+    pred <- ifelse(predict(gbmod,newdata = santr[,-307], n.trees=ntrees[i], type="response")>0.5,1,0)
+    te <- mean(pred!=ytr)
+    boostres <- rbind(boostres,c(i,j,k,te))
+    }
+  }
+}
+toc() #1128.39 sec~ 19min
+
+#select best parameters that minimizes training error 
+bdf <- as.data.frame(boostres)
+colnames(bdf) <- c("ntrees","shrink","idepth","trainError")
+#bdf
+#bdf[which.min(bdf$trainError),]
+bparams <- bdf[which.min(bdf$trainError),] 
+
+#train boosting model using best parameters 
+tic(gbm)
+gbmod <- gbm(TARGET ~ .,data=santr,
+                 distribution = 'adaboost',
+                   n.trees = ntrees[bparams[[1]]], 
+                   shrinkage = shrink[bparams[[2]]], 
+                   interaction.depth = idepth[bparams[[3]]],
+                   cv.folds = 10)
+toc() #141.39 sec
+
+#summary(gbmod) #which variances are important
+perf_gbm1 = gbm.perf(gbmod, method="cv") 
+perf_gbm1 #estimated optimal number of iterations 72
+
+
+##---------- training error ##----------
+#predict
+pred1 <- ifelse(predict(fullmod, santr[,-307], type="response")>0.5,1,0)
+pred2 <- ifelse(predict(lassomod, xtr, s=lassoLambda, type="fit", mode="lambda")$fit>0.5,1,0)
+pred3 <- predict(ldamod,xs[,-rcol])$class; 
+pred4 <- ifelse(predict(lrmod, X[1:nrow(santr),], type="response", s=lrcv$lambda.min)>0.5,1,0)
+pred5 <- predict(rfmod, santr, type='class')
+pred6 <- ifelse(predict(gbmod,newdata = santr[,-307], n.trees=perf_gbm1, type="response")>0.5,1,0)
+
+
+#calculate training error
+trainerror <- NULL
+trainerror <- cbind(trainerror, mean(pred1 != ytr));
+trainerror <- cbind(trainerror, mean(pred2 != ytr));
+trainerror <- cbind(trainerror, mean(pred3 != ytr));
+trainerror <- cbind(trainerror, mean(pred4 != ytr));
+trainerror <- cbind(trainerror, mean(pred5 != ytr));
+trainerror <- cbind(trainerror, mean(pred6 != ytr));
+
+#display result
+trainerror <- as.data.frame(trainerror)
+colnames(trainerror) <- c("LogRed","Lasso lars","ElasticNet","LDA","RandomForest","Boosting")
+trainerror
+
+
+```
+
+## Validate
+
+```{r}
+##---------- validate ##----------
+
+#prepare validation data
+xva <- as.matrix(sanva[,-307])
+xsva <- sanva[,colnames(xs)]
+xva4 <- X[(nrow(santr)+1):(nrow(santr)+nrow(sanva)),-307]
+yva <- sanva[,307]
+
+#predict
+pred1va <- ifelse(predict(fullmod, sanva, type="response")>0.5,1,0)
+pred2va <- ifelse(predict(lassomod, xva, s=lassoLambda, type="fit", mode="lambda")$fit>0.5,1,0)
+pred3va <- predict(ldamod,xsva[,-rcol])$class
+pred4va <- ifelse(predict(lrmod, xva4, type="response", s=lrcv$lambda.min)>0.5,1,0)
+pred5va <- predict(rfmod,sanva,type="class")
+pred6va <- ifelse(predict(gbmod,newdata = sanva[,-307], n.trees=perf_gbm1, type="response")>0.5,1,0)
+
+#calculate validation error
+vaerror <- NULL
+vaerror <- cbind(vaerror, mean(pred1va != yva));
+vaerror <- cbind(vaerror, mean(pred2va != yva));
+vaerror <- cbind(vaerror, mean(pred3va != yva));
+vaerror <- cbind(vaerror, mean(pred4va != yva));
+vaerror <- cbind(vaerror, mean(pred5va != yva));
+vaerror <- cbind(vaerror, mean(pred6va != yva));
+
+#display result
+vaerror <- as.data.frame(vaerror)
+colnames(vaerror) <- c("LogRed","Lasso lars","LDA","ElasticNet","RandomForest","Boosting")
+vaerror
+
+
+```
+
+## Test
+
+```{r}
+##---------- testing ##----------
+
+#prepare testing data
+xtest <- as.matrix(sante[,-307])
+xstest <- sante[,colnames(xs)]
+xte4 <- X[(nrow(santr)+nrow(sanva)+1):(nrow(santr)+nrow(sanva)+nrow(sante)),-307]
+ytest <- sante[,307]
+
+#predict
+pred1test <- ifelse(predict(fullmod, sante, type="response")>0.5,1,0)
+pred2test <- ifelse(predict(lassomod, xtest, s=lassoLambda, type="fit", mode="lambda")$fit>0.5,1,0)
+pred3test <- predict(ldamod,xstest[,-rcol])$class
+pred4test <- ifelse(predict(lrmod, xte4, type="response", s=lrcv$lambda.min)>0.5,1,0)
+pred5test <- predict(rfmod,sante,type="class")
+pred6test <- ifelse(predict(gbmod,newdata = sante[,-307], n.trees=perf_gbm1, type="response")>0.5,1,0)
+
+#calculate testing error
+testerror <- NULL
+testerror <- cbind(testerror, mean(pred1test != ytest));
+testerror <- cbind(testerror, mean(pred2test != ytest));
+testerror <- cbind(testerror, mean(pred3test != ytest));
+testerror <- cbind(testerror, mean(pred4test != ytest));
+testerror <- cbind(testerror, mean(pred5test != ytest));
+testerror <- cbind(testerror, mean(pred6test != ytest));
+
+#display result
+testerror <- as.data.frame(testerror)
+colnames(testerror) <- c("LogRed","Lasso lars","LDA","ElasticNet","RandomForest","Boosting")
+testerror
+
+
+```
